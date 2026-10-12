@@ -1,0 +1,208 @@
+#!/system/bin/sh
+# Holds /sys backlight so One UI cannot snap peak brightness back.
+# mode file: off | auto | pct:N
+# Lock screen and AOD are left to the system. Crossing into them
+# only drops out of the peak range once, then this loop stops writing.
+
+BL=/sys/class/backlight/panel0-backlight/brightness
+POWER=/sys/class/backlight/panel0-backlight/bl_power
+PANEL_LUX=/sys/class/lcd/panel/lux
+DIR=/data/adb/peakbright
+MODEFILE=$DIR/mode
+PIDFILE=$DIR/daemon.pid
+STATE=$DIR/state
+NORMAL_TOP=25500
+HBM_LO=25800
+HBM_HI=44700
+
+mkdir -p "$DIR"
+
+if [ -f "$PIDFILE" ]; then
+  old=$(cat "$PIDFILE" 2>/dev/null)
+  if [ -n "$old" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null; then
+    exit 0
+  fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"; exit 0' TERM INT
+
+first_int() {
+  s=$(cat "$1" 2>/dev/null) || return 1
+  s=$(printf '%s' "$s" | tr ',' ' ' | tr -cd '0-9 \n')
+  set -- $s
+  case $1 in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  echo "$1"
+}
+
+clamp_hi() {
+  v=$1
+  [ "$v" -lt 800 ] && v=800
+  [ "$v" -gt "$HBM_HI" ] && v=44700
+  if [ -r "$BL" ]; then
+    mx=$(first_int "$(dirname "$BL")/max_brightness" 2>/dev/null)
+    if [ -n "$mx" ] && [ "$v" -gt "$mx" ]; then
+      v=$mx
+    fi
+  fi
+  echo "$v"
+}
+
+lux_to_level() {
+  L=$1
+  case $L in
+    ''|*[!0-9]*) L=0 ;;
+  esac
+  if [ "$L" -le 50 ]; then
+    echo $(( 2000 + (8000 - 2000) * L / 50 ))
+  elif [ "$L" -le 300 ]; then
+    echo $(( 8000 + (18000 - 8000) * (L - 50) / 250 ))
+  elif [ "$L" -le 1000 ]; then
+    echo $(( 18000 + (NORMAL_TOP - 18000) * (L - 300) / 700 ))
+  elif [ "$L" -le 3000 ]; then
+    echo $(( HBM_LO + (32000 - HBM_LO) * (L - 1000) / 2000 ))
+  elif [ "$L" -le 10000 ]; then
+    echo $(( 32000 + (40000 - 32000) * (L - 3000) / 7000 ))
+  else
+    v=$(( 40000 + (HBM_HI - 40000) * (L - 10000) / 40000 ))
+    [ "$v" -gt "$HBM_HI" ] && v=$HBM_HI
+    echo "$v"
+  fi
+}
+
+pct_to_level() {
+  p=$1
+  case $p in
+    ''|*[!0-9]*) p=0 ;;
+  esac
+  [ "$p" -gt 100 ] && p=100
+  if [ "$p" -le 57 ]; then
+    echo $(( 800 + (NORMAL_TOP - 800) * p / 57 ))
+  else
+    echo $(( HBM_LO + (HBM_HI - HBM_LO) * (p - 57) / 43 ))
+  fi
+}
+
+read_lux() {
+  if [ -r "$PANEL_LUX" ]; then
+    v=$(first_int "$PANEL_LUX") && { echo "panel $v"; return; }
+  fi
+  for f in /sys/class/sensors/light_sensor/lux \
+           /sys/class/sensors/light_sensor/raw_data \
+           /sys/devices/virtual/sensors/light_sensor/lux \
+           /sys/class/sensors/lsensor/light; do
+    if [ -r "$f" ]; then
+      v=$(first_int "$f") || continue
+      [ "$v" -gt 200000 ] && continue
+      echo "sensor $v"
+      return
+    fi
+  done
+  line=$(dumpsys display 2>/dev/null | grep -m1 mAmbientLux)
+  if [ -n "$line" ]; then
+    n=$(printf '%s' "$line" | tr -cd '0-9.')
+    n=${n%%.*}
+    case $n in
+      ''|*[!0-9]*) ;;
+      *) echo "dumpsys $n"; return ;;
+    esac
+  fi
+  echo "none 0"
+}
+
+# 0 = use our brightness, 1 = lock screen / AOD / screen off
+display_idle() {
+  if [ -r "$POWER" ]; then
+    p=$(cat "$POWER" 2>/dev/null)
+    [ "$p" = "0" ] || { echo 1; return; }
+  fi
+  if [ $((tick % 5)) -eq 1 ] || [ -z "$WAKE" ]; then
+    WAKE=$(dumpsys power 2>/dev/null | grep -m1 'mWakefulness=')
+    LOCK=$(dumpsys window 2>/dev/null | grep -m1 'mShowingLockscreen=')
+  fi
+  case $WAKE in
+    *Dozing*|*Asleep*|*Dreaming*) echo 1; return ;;
+  esac
+  case $LOCK in
+    *true*) echo 1; return ;;
+  esac
+  echo 0
+}
+
+release_peak() {
+  cur=$(first_int "$BL") || return
+  if [ "$cur" -gt "$NORMAL_TOP" ]; then
+    echo "$NORMAL_TOP" > "$BL" 2>/dev/null
+  fi
+}
+
+seen=0
+tick=0
+lux=0
+src=none
+level=0
+idle=0
+was_idle=0
+WAKE=
+LOCK=
+
+while true; do
+  mode=$(cat "$MODEFILE" 2>/dev/null)
+  [ -n "$mode" ] || mode=off
+  tick=$((tick + 1))
+  write=0
+  case "$mode" in
+    off)
+      seen=0
+      idle=0
+      was_idle=0
+      ;;
+    auto|pct:*)
+      idle=$(display_idle)
+      if [ "$idle" = "1" ]; then
+        if [ "$was_idle" != "1" ]; then
+          release_peak
+          was_idle=1
+        fi
+      else
+        was_idle=0
+        case "$mode" in
+          auto)
+            if [ $((tick % 4)) -eq 1 ] || [ "$src" = "none" ]; then
+              set -- $(read_lux)
+              src=$1
+              lux=$2
+              case $lux in
+                ''|*[!0-9]*) lux=0 ;;
+              esac
+              if [ "$lux" -gt 0 ]; then
+                seen=1
+              fi
+            fi
+            if [ "$seen" -eq 1 ]; then
+              level=$(lux_to_level "$lux")
+              level=$(clamp_hi "$level")
+              write=1
+            fi
+            ;;
+          pct:*)
+            level=$(pct_to_level "${mode#pct:}")
+            level=$(clamp_hi "$level")
+            write=1
+            src=manual
+            ;;
+        esac
+      fi
+      ;;
+    *)
+      ;;
+  esac
+  if [ "$write" -eq 1 ]; then
+    echo "$level" > "$BL" 2>/dev/null
+  fi
+  now=$(first_int "$BL" 2>/dev/null)
+  printf 'mode=%s\nlux=%s\nsrc=%s\nlevel=%s\nnow=%s\nseen=%s\nidle=%s\n' \
+    "$mode" "$lux" "$src" "$level" "$now" "$seen" "$idle" > "$STATE"
+  sleep 0.4
+done
